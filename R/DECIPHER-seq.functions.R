@@ -1,7 +1,7 @@
 ##### Set up LIGER objects and run consensus iNMF across range of K values #################
 iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Batch = TRUE, 
                         scale.factor = 10000, k.max = 40, n.reps = 20, nn.pt = 0.3,
-                        max.cores = NULL, output.reps = FALSE, return.scale.data = T){
+                        max.cores = NULL, output.reps = FALSE, return.scale.data = T, org = 'human'){
   if (!"Sample"%in%colnames(seurat.object@meta.data) | 
       !"Type"%in%colnames(seurat.object@meta.data)){
     stop("metadata slot must contain colnames 'Sample' and 'Type'")
@@ -15,12 +15,13 @@ iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Ba
     stop("n.reps or nn.pt too low to find consensus results")
   }
   library(rliger); library(Matrix); library(matrixStats); library(parallel); 
-  library(cluster); library(stats); library(rlist); library(liger); library(RANN)
+  library(cluster); library(stats); library(rlist); library(RANN);library(parallelly);
+  library(cli); library(doParallel); library(RcppPlanc)
   
   # Process Seurat object and determine which cell types to analyze
   DefaultAssay(seurat.object)="RNA"
   if ("integrated" %in% Assays(seurat.object)){
-    seurat.object[['integrated']] <- NULL
+    seurat.object@assays[['integrated']] <- NULL
   }
   # Only run analysis on cell types that represented across at least 10 samples with at least 100 cells per sample (or adjust inputs above)
   cell.types <- names(which(colSums(table(seurat.object@meta.data[,c("Sample","Type")])>=Type.thresh)>=Sample.thresh))
@@ -43,53 +44,86 @@ iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Ba
         Batch.list <- SplitObject(seu_sub, split.by="Batch")
         Liger.setup=list()
         for (j in 1:length(Batch.list)){
-          Liger.setup[[j]]=Batch.list[[j]]@assays$RNA@counts
+          Liger.setup[[j]]=Batch.list[[j]]@assays[["RNA"]]@layers[["counts"]]
+          if (any(sapply(Liger.setup[[j]]@Dimnames, is.null))){
+            cat('Filling in Dimnames (NULL in Seurat Object)...\n')
+            Liger.setup[[j]]@Dimnames[[1]] <- rownames(Batch.list[[j]]) 
+            Liger.setup[[j]]@Dimnames[[2]] <- colnames(Batch.list[[j]])
+          }
         }
         names(Liger.setup)=names(Batch.list)
-        Liger <- createLiger(Liger.setup)
+        Liger <- createLiger(Liger.setup, organism = org)
       } 
     } else {
       seu_sub <- AddMetaData(seu_sub, col.name = 'Batch', metadata = 'Batch')
-      Liger <- createLiger(list(Batch1 = seu_sub@assays$RNA@counts))
+      Liger <- createLiger(list(Batch1 = seu_sub@assays[["RNA"]]@layers[["counts"]]), organism = org)
     }
+    
     # normalize so all cells have same total counts
     Liger <- rliger::normalize(Liger)
     Liger <- selectGenes(Liger)
+    
     # log normalize (this combined with the normalize step above is the same as LogNormalize in Seurat)
-    for (k in 1:length(Liger@norm.data)){
-      Liger@norm.data[[k]]=as.sparse(as.matrix(log1p(Liger@norm.data[[k]]*scale.factor)))
+    for (k in 1:length(Liger@datasets)){
+      Liger@datasets[[k]]@normData=as.sparse(as.matrix(log1p(Liger@datasets[[k]]@normData*scale.factor)))
     }
+    
     # scale without centering
     Liger <- rliger::scaleNotCenter(Liger)
-    
+    cat('done scaling')
     # adjust online_iNMF parameters based on dataset size
     minibatch_size <- min(table(seu_sub@meta.data$Batch))
     if (minibatch_size > 5000) {
-      minibatch_size = 5000} else if (minibatch_size > 1000) { 
-        minibatch_size = floor(minibatch_size/1000)*1000} else if (minibatch_size > 500) { 
-          minibatch_size = floor(minibatch_size/500)*500} else if (minibatch_size > 100) { 
-            minibatch_size = floor(minibatch_size/100)*100} else minibatch_size = minibatch_size 
+      minibatch_size = 5000} 
+    else if (minibatch_size > 1000) { 
+      minibatch_size = floor(minibatch_size/1000)*1000
+    } 
+    else if (minibatch_size > 500) { 
+      minibatch_size = floor(minibatch_size/500)*500
+    } 
+    else if (minibatch_size > 100) { 
+      minibatch_size = floor(minibatch_size/100)*100
+    } 
+    else minibatch_size = minibatch_size 
     h5_chunk_size <- min(1000, minibatch_size)
     
+    # Determine the number of cores allocated
+    num_cores <- parallelly::availableCores()
+    
+    # Create a cluster with the allocated cores
+    cl <- makeCluster(num_cores)
+    registerDoParallel(cl)
+    required_packages <- c("rliger", "Matrix", "Rcpp", "ggplot2", "dplyr", "magrittr", "foreach", "doParallel")
+    
     Liger_list = list()
-    for (k in c(2:k.max)){
+    # Source functions to cluster
+    source("./DECIPHER-seq.functions.R", local = TRUE)
+    
+    # Parallelize Liger.run for all replicates and all k values
+    results <- foreach(k = 2:k.max, .packages = required_packages, .export = c('n.reps')) %dopar% {
       print(paste0('Running K = ', k))
       reps.k = rep(k, n.reps)
       names(reps.k) = paste0("rep", 1:length(reps.k))
-      gc()
-      Liger_list[[paste0("R", k)]] = mcmapply(LIGER.run, K = reps.k, Liger = c(Liger), 
-                                            minibatch_size = minibatch_size, h5_chunk_size = h5_chunk_size,
-                                            SIMPLIFY = F)
-      for (i in 1:length(Liger_list[[paste0("R", k)]])){
-        colnames(Liger_list[[paste0("R", k)]][[i]][["W"]]) =  paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["W"]])) 
-        colnames(Liger_list[[paste0("R", k)]][[i]][["H"]]) = paste0("Rep", i, "_", colnames(Liger_list[[paste0("R", k)]][[i]][["H"]]))
-        Liger_list[[paste0("R", k)]][[i]][["V"]] = lapply(Liger_list[[paste0("R", k)]][[i]][["V"]], function(y) {
+      inner_list <- list()
+      
+      for (i in seq_along(reps.k)){
+        result = LIGER.run(Liger, reps.k[[i]], minibatch_size, h5_chunk_size)
+        colnames(result[["W"]]) =  paste0("Rep", i, "_", colnames(result[["W"]])) 
+        colnames(result[["H"]]) = paste0("Rep", i, "_", colnames(result[["H"]]))
+        result[["V"]] = lapply(result[["V"]], function(y) {
           colnames(y) = paste0("Rep", i, "_", colnames(y))
           return(y)})
+      inner_list[[paste0("rep", i)]] <- result
       }
-      gc()
       print(paste0('Done with ', x, ' K = ', k))
+      return(inner_list)
     }
+    
+    names(results) <- paste0("R", 2:k.max)
+    Liger_list <- results
+    
+    # Stop the cluster
+    stopCluster(cl)
     
     # FIND CONSENSUS RESULTS
     print(paste0('Finding consensus results'))
@@ -133,7 +167,7 @@ iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Ba
       for (i in names(V_list)){
         V_list[[i]] = lapply(V_list[[i]], function(x){t(t(x)*(1/W_2norm[[i]]))})
       }
-      V.mat = t(list.cbind(lapply(V_list, list.rbind)))
+      V.mat = t(list.cbind(lapply(V_list, list.rbind))) # row bind batches for each replicate, column bind replicates, transpose
       if (sum(nn.dist>min)>0) {
         V.mat.filt = V.mat[-which(nn.dist>min),]
       } else {
@@ -149,21 +183,33 @@ iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Ba
       rownames(V_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
       colnames(V_consensus) = colnames(V.mat.filt)
       Batch.info = 1:length(V_list$rep1)
-      names(Batch.info) = sort(names(V_list$rep1))
+      names(Batch.info) = names(V_list$rep1)
+      
       V_consensus = lapply(Batch.info, function(x){
         V = V_consensus[,((x-1)*length(colnames(W_consensus))+1):(x*length(colnames(W_consensus)))]
       })
       
       # Solve for H (activity program expression scores) using consensus W and V initializations
       H_consensus_list = lapply(Batch.info, function(x){
-        H = solveNNLS(rbind(t(W_consensus) + t(V_consensus[[x]]), 
-                            sqrt(5) * t(V_consensus[[x]])), rbind(t(Liger@scale.data[[x]]), matrix(0, 
-                                                                                                   dim(W_consensus)[2], dim(Liger@raw.data[[x]])[2])))
+        H = RcppPlanc::bppnnls(rbind(t(W_consensus) + t(V_consensus[[x]]), 
+                                     sqrt(5) * t(V_consensus[[x]])), 
+                               rbind(Liger@datasets[[x]]@scaleData, matrix(0, dim(W_consensus)[2], dim(Liger@datasets[[x]]@rawData)[2])))
       })
       H_consensus_list = lapply(H_consensus_list, t)
       H_consensus = list.rbind(H_consensus_list)
       rownames(H_consensus) = rownames((lapply(x, `[[`, "H"))[[1]])
+      
+      # rliger sets H rownames as batch_cellID, which causes issues later on in calc.H.score
+      
+      # Create a vector of all possible prefixes for H cellID rownames
+      prefixes <- paste0(unique(seurat.object@meta.data$Batch), '_')
+      # Create a regex pattern that matches any of the prefixes at the start of the rowname
+      pattern <- paste0("^(", paste(prefixes, collapse = "|"), ")")
+      # Remove the matched prefix
+      rownames(H_consensus) <- sub(pattern, "", rownames(H_consensus))
+      
       colnames(H_consensus) = paste0("R", kmeans_clusts, "_Program", seq(kmeans_clusts))
+      
       consensus_res = list(H = H_consensus, W = W_consensus, V = V_consensus)
       return(consensus_res)
     })
@@ -171,7 +217,7 @@ iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Ba
     
     res = list()
     if (return.scale.data){
-      res[["scale.data"]] = Liger@scale.data
+      res[["scale.data"]] = lapply(datasets(Liger), function(ds) scaleData(ds))
     }
     if (output.reps) {
       res[["Liger.list"]] = Liger_list
@@ -189,7 +235,7 @@ build_phylo_tree <- function(x){
   # add in dummy program as outgroup to root tree (for depth-first search)
   W_list = lapply(x$consensus.results, '[[', "W")
   W_list = lapply(W_list, t)
-  #W_list[["root"]] <- as.matrix(data.frame(root = sample(rowMedians(W_list$R2))))
+
   W_list[["root"]] <- as.matrix(data.frame(root = rowMedians(W_list$R2)))
   W_list = W_list[c("root", names(x$consensus.results))]
   
@@ -554,16 +600,17 @@ Marker_gene_analysis <- function(NMF_results_atK, NMF_results){
   H_consensus_k_use = lapply(NMF_results_atK, "[[", "H")
   scale.data <- lapply(NMF_results, `[[`, "scale.data")
   W_mat = mcmapply(function(W, H, data) {
-    Liger.data = t(list.rbind(data))
+    Liger.data = list.cbind(data)
     mat=data.frame(matrix(nrow=nrow(Liger.data), ncol=ncol(H)))
     rownames(mat)=rownames(Liger.data)
     colnames(mat)=colnames(H)
+    cli_progress_bar("Processing", total = length(rownames(mat))) # added progress bar
     for(gene_ind in rownames(mat)){
-      cat('.')
       res = unlist(lapply(1:ncol(mat), function(j){
         summary(lm(Liger.data[gene_ind,] ~ H[colnames(Liger.data),j]))$coef[2,1]
       }))
       mat[gene_ind,] = res
+      cli_progress_update() # added progress bar update
     }
     return(mat)
   }, W = W_consensus_k_use, H = H_consensus_k_use, data = scale.data, SIMPLIFY = F, mc.cores = detectCores())
@@ -620,7 +667,7 @@ Get_enrichment_pvals <- function(sets_to_test, Network, nreps = 10000){
   
   # only test for enrichment for gene sets with at least five significantly enriched nodes (fdr < 0.01)
   fgsea_test = subset(fgsea_test, pathway %in% names(which(table(subset(fgsea_test, fdr < 0.01&NES>0)$pathway)>=5))) 
-
+  
   message(paste0("Testing ", length(unique(fgsea_test$pathway)), " gene sets"))
   
   # only test for positive enrichment
@@ -711,24 +758,24 @@ Calculate_metadata_associations <- function(Network, Expression_score, metadata,
 
 ##### Basic functions #################
 
-solveNNLS <- function(C, B) {
-  .Call('_rliger_solveNNLS', PACKAGE = 'rliger', C, B)
-}
-
 # wrapper function for running online_iNMF
-LIGER.run <- function(K, Liger, minibatch_size, h5_chunk_size, seed = NULL){
+LIGER.run <- function(Liger, K, minibatch_size, h5_chunk_size, seed = NULL){
   # sample seeds and report for reproducibility
   if (is.null(seed)) {seed = sample(1:1000000, 1)}
-  Liger <- online_iNMF(Liger, k = K, max.epochs=10, seed = seed, miniBatch_size = minibatch_size, h5_chunk_size = h5_chunk_size, verbose = F)
-  cat(".")
-  W_res = t(Liger@W)
+
+  Liger <- runOnlineINMF(object = Liger, k = K, maxEpochs=10, seed = seed, minibatchSize = minibatch_size, h5_chunk_size = h5_chunk_size, verbose = T) 
+  W_res = Liger@W 
   colnames(W_res) = paste0("R", K, "_Program", 1:K)
-  H_res = list.rbind(Liger@H)
+  
+  H_list <- lapply(Liger@datasets, function(dataset) t(dataset@H))
+  # Combine all 'H' matrices into one data frame
+  H_res <- do.call(rbind, H_list)
+  
   colnames(H_res) = paste0("R", K, "_Program", 1:K)
-  V_res = Liger@V
+
+  V_res <- lapply(Liger@datasets, function(dataset) dataset@V)
   V_res = lapply(V_res, function(y){
-    rownames(y) = paste0("R", K, "_Program", 1:K)
-    y = t(y)
+    colnames(y) = paste0("R", K, "_Program", 1:K)
     return(y)
   })
   params = c(minibatch_size = minibatch_size, h5_chunk_size = h5_chunk_size)
