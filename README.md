@@ -1,3 +1,5 @@
+*This is a fork from lmurrow/DECIPHER-seq which updates the DECIPHER-seq package to work with more recent versions of its dependencies (i.e. Seurat v5, rliger v2).*
+
 Data and code for “Mapping hormone-regulated cell-cell interaction networks in the human breast at single-cell resolution” (Murrow et al.)
 ------------------------------------------------------------------------------------------------------------
 
