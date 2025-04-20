@@ -113,7 +113,7 @@ iNMF_ksweep <- function(seurat.object, Type.thresh = 100, Sample.thresh = 10, Ba
         result[["V"]] = lapply(result[["V"]], function(y) {
           colnames(y) = paste0("Rep", i, "_", colnames(y))
           return(y)})
-      inner_list[[paste0("rep", i)]] <- result
+        inner_list[[paste0("rep", i)]] <- result
       }
       print(paste0('Done with ', x, ' K = ', k))
       return(inner_list)
@@ -235,7 +235,7 @@ build_phylo_tree <- function(x){
   # add in dummy program as outgroup to root tree (for depth-first search)
   W_list = lapply(x$consensus.results, '[[', "W")
   W_list = lapply(W_list, t)
-
+  
   W_list[["root"]] <- as.matrix(data.frame(root = rowMedians(W_list$R2)))
   W_list = W_list[c("root", names(x$consensus.results))]
   
@@ -594,26 +594,42 @@ Infer_direct_interactions <- function(Expression_score, Network, metadata, cellt
 }
 
 # Marker genes  - Identify genes associated with each activity program (also see Kotliar et al.) ####
+library(pbmcapply)
 
 Marker_gene_analysis <- function(NMF_results_atK, NMF_results){
-  W_consensus_k_use = lapply(NMF_results_atK, "[[", "W")
-  H_consensus_k_use = lapply(NMF_results_atK, "[[", "H")
-  scale.data <- lapply(NMF_results, `[[`, "scale.data")
-  W_mat = mcmapply(function(W, H, data) {
-    Liger.data = list.cbind(data)
-    mat=data.frame(matrix(nrow=nrow(Liger.data), ncol=ncol(H)))
-    rownames(mat)=rownames(Liger.data)
-    colnames(mat)=colnames(H)
-    cli_progress_bar("Processing", total = length(rownames(mat))) # added progress bar
-    for(gene_ind in rownames(mat)){
-      res = unlist(lapply(1:ncol(mat), function(j){
-        summary(lm(Liger.data[gene_ind,] ~ H[colnames(Liger.data),j]))$coef[2,1]
-      }))
-      mat[gene_ind,] = res
-      cli_progress_update() # added progress bar update
-    }
-    return(mat)
-  }, W = W_consensus_k_use, H = H_consensus_k_use, data = scale.data, SIMPLIFY = F, mc.cores = detectCores())
+  # extract lists
+  H_list <- lapply(NMF_results_atK, "[[", "H")           # get each cells × k
+  data_list <- lapply(NMF_results, "[[", "scale.data")  # get each list of gene × cell mats
+  
+  ncores <- max(1, parallel::detectCores() - 2)
+  out <- pbmclapply(seq_along(H_list), function(i){
+    H <- H_list[[i]]
+    # bind per-batch scale.data into one gene × cell matrix
+    L <- do.call(cbind, data_list[[i]])  
+    
+    ## 1) center genes and factors
+    gene_means <- rowMeans(L) # length = #genes
+    L_cent <- L - gene_means  # broadcasting over cols
+    
+    factor_means <- colMeans(H) # length = k
+    H_cent <- sweep(H, 2, factor_means, "-") # cells × k
+    
+    ## 2) compute covariance numerator: (genes×cells) %*% (cells×k) --> genes×k
+    cov_mat <- L_cent %*% H_cent
+    
+    ## 3) compute variance of each factor and divide
+    var_h <- colSums(H_cent^2) # length = k
+    slope_mat <- sweep(cov_mat, 2, var_h, "/")
+    
+    # restore dimnames and return
+    colnames(slope_mat) <- colnames(H)
+    rownames(slope_mat) <- rownames(L)
+    as.data.frame(slope_mat)
+  }, mc.cores = ncores)
+  
+  names(out) <- names(H_list) # restore names
+  
+  return(out)
 }
 
 combine_marker_matrices <- function(marker_gene_matrix){
@@ -630,35 +646,66 @@ combine_marker_matrices <- function(marker_gene_matrix){
 }
 
 # Run fgsea, combine results, and calculate fdr ####
+library(fgsea)
+library(data.table)
+library(parallel)
 
-fgsea_test <- function(marker_gene_list, Network, path_list, ncores){
-  for (i in names(marker_gene_list)){
-    marker_gene_list[[i]] <- marker_gene_list[[i]][,paste(i, colnames(marker_gene_list[[i]]), sep = ".")%in%names(Network$filtered_modules)]
-  }
-  res = mclapply(marker_gene_list, function(marker_gene_matrix){
-    res_list = apply(marker_gene_matrix, 2, function(x){
-      Program_test = as.numeric(x)
-      names(Program_test) = rownames(marker_gene_matrix)
-      res = fgsea(pathways = path_list, stats = Program_test, 
-                  minSize=10, maxSize=Inf, eps=1e-50, nPermSimple=10000)
-    })
-    res_mat = list.rbind(res_list)
-    n_pathways = dim(res_list[[1]])[1]
-    res_mat$Program = rep(colnames(marker_gene_matrix), each = n_pathways)
-    return(res_mat)
+fgsea_test <- function(marker_gene_list, Network, path_list, ncores = detectCores() - 2, modules = 'filtered') {
+  
+  # 1) Flatten your list-of-matrices into a list of named weight‐vectors (names = genes, values = nmf weights, 1 per celltype.program)
+  weights_list <- unlist(
+    lapply(names(marker_gene_list), function(celltype) {
+      mat <- marker_gene_list[[celltype]]
+      # only keep columns that correspond to filtered modules
+      if (modules == 'filtered') {
+        keep <- paste(celltype, colnames(mat), sep=".") %in% names(Network$filtered_modules)
+        mat <- mat[, keep, drop=FALSE]
+      } else if (modules == 'all') {
+        # keep full matrix
+      } else {
+        stop("modules argument must be either 'filtered' or 'all'")
+      }
+      
+      # build a little list for each column
+      lapply(seq_len(ncol(mat)), function(j) {
+        v <- mat[, j]
+        names(v) <- rownames(mat)
+        list(name = paste(celltype, colnames(mat)[j], sep="."),
+             weights = v)
+      })
+    }),
+    recursive = FALSE
+  )
+  
+  # 2) Parallel fgsea on each celltype.program (cp) vector
+  res_list <- pbmclapply(weights_list, function(cp) {
+    # use the multilevel algorithm for speed
+    fg <- fgseaMultilevel(pathways = path_list,
+                          stats = cp$weights,
+                          minSize  = 10,
+                          maxSize  = Inf)
+    # annotate back the celltype/Program
+    fg[, Type := sub("\\..*$", "", cp$name)]
+    fg[, Program := sub("^.*\\.", "", cp$name)]
+    return(fg)
   }, mc.cores = ncores)
-  for (i in names(res)){
-    res[[i]]$Type = i
-  }
-  res = list.rbind(res)
-  res$module = paste0(res$Type, "." , res$Program)
-  res$module = plyr::mapvalues(res$module, from = names(Network$filtered_modules)[names(Network$filtered_modules)%in%res$module], 
-                               to = Network$filtered_modules[names(Network$filtered_modules)%in%res$module])
-  res$fdr = p.adjust(res$pval, method = "fdr")
-  return(res)
+  
+  # 3) rbind everything
+  dt <- data.table::rbindlist(res_list)
+  
+  # 4) map to 'module' via named‐vector lookup
+  # Network$filtered_modules is (named) where names=“Type.Program”
+  dt[, module := Network$filtered_modules[paste(Type, Program, sep=".")]]
+  
+  # 5) final FDR adjustment
+  dt[, fdr := p.adjust(pval, method="fdr")]
+  
+  return(dt)
 }
 
+
 # Permutation test to calculate fdr of gene set enrichment within a module ####
+library(pbapply)
 Get_enrichment_pvals <- function(sets_to_test, Network, nreps = 10000){
   mat = Network$mat[names(Network$filtered_modules), names(Network$filtered_modules)]
   
@@ -678,7 +725,7 @@ Get_enrichment_pvals <- function(sets_to_test, Network, nreps = 10000){
   names(Test) = Test
   clust_size = table(Network$filtered_modules)
   names(clust_size) = paste0("Module_", names(clust_size))
-  node_boot_fgsea_fdr = lapply(Test, function(x){
+  node_boot_fgsea_fdr = pblapply(Test, function(x){
     Test_fgsea_test = subset(fgsea_test, pathway==x)
     Test_fdr = Test_fgsea_test$fdr
     names(Test_fdr) = Test_fgsea_test$node_id
@@ -762,7 +809,7 @@ Calculate_metadata_associations <- function(Network, Expression_score, metadata,
 LIGER.run <- function(Liger, K, minibatch_size, h5_chunk_size, seed = NULL){
   # sample seeds and report for reproducibility
   if (is.null(seed)) {seed = sample(1:1000000, 1)}
-
+  
   Liger <- runOnlineINMF(object = Liger, k = K, maxEpochs=10, seed = seed, minibatchSize = minibatch_size, h5_chunk_size = h5_chunk_size, verbose = T) 
   W_res = Liger@W 
   colnames(W_res) = paste0("R", K, "_Program", 1:K)
@@ -772,7 +819,7 @@ LIGER.run <- function(Liger, K, minibatch_size, h5_chunk_size, seed = NULL){
   H_res <- do.call(rbind, H_list)
   
   colnames(H_res) = paste0("R", K, "_Program", 1:K)
-
+  
   V_res <- lapply(Liger@datasets, function(dataset) dataset@V)
   V_res = lapply(V_res, function(y){
     colnames(y) = paste0("R", K, "_Program", 1:K)
